@@ -26,8 +26,16 @@ public class Phase1OsCpuLab {
 
     // --- Defaults (tune if your machine is slow/fast) ---
     static long CPU_WORK_ITERS_PER_THREAD = 25_000_000L;   // Experiment 1 total work per thread
+    // 총 작업량 = itersPerThread × threadCount
+    // CPU-bound 작업을 충분히 오래 돌려서 스케줄링·캐시·병렬화 패턴이 ‘노이즈 없이’ 드러나게 하기
+    // 각 스레드에게 이만큼 일하고 나와 라고 시키는 ‘업무량’이다
+
     static int WAIT_SECONDS = 3;                           // Experiment 3 waiting duration
-    static String THREAD_LIST = "1,2,4,8,16,32";           // Thread counts to test
+    // 3초 이유: 대기 방식(busy / sleep / blocking)의 CPU 사용 차이를 사람 눈으로도 확실히 체감할 수 있게 만들기
+
+//    static String THREAD_LIST = "1,2,4,8,16,32";           // Thread counts to test
+    static String THREAD_LIST = "1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32";           // Thread counts to test
+    // 스레드 수 증가에 따른 성능 곡선을 ‘점’이 아니라 ‘선’으로 보기
 
     // Make sure the JIT doesn't optimize away the loop entirely
     static volatile long BLACKHOLE = 0;
