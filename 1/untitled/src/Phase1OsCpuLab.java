@@ -56,6 +56,7 @@ public class Phase1OsCpuLab {
                 .filter(s -> !s.isEmpty())
                 .mapToInt(Integer::parseInt)
                 .toArray();
+        System.out.println("Threads: " + Arrays.toString(threadsToTest));
 
         // Warm up (important for JIT stabilization)
         warmup();
@@ -91,6 +92,17 @@ public class Phase1OsCpuLab {
         System.out.println("- CPU-bound 작업은 대개 스레드가 '코어 수' 근처에서 가장 효율적");
         System.out.println("- 코어 수를 크게 넘기면: context switch 증가 + cache thrash + 스케줄러 오버헤드로 throughput이 정체/하락");
         System.out.println();
+        System.out.println(" threads |   wall(ms) |     throughput |    cpuTime(ms) |    cpuUtil~(%)");
+        System.out.println("      28 |         64 |       10830.98 |           1719 |           95.9");
+        System.out.println("CPU-bound 작업은 ‘코어 수 근처’에서 최대 처리량이 나올 가능성이 높다.");
+        System.out.println("하지만 효율과 안정성은 그보다 낮은 지점에서 최고다.");
+        System.out.println("cpuUtil 95.9%의 함정은 '효율적으로 태웠다' 가 아니라 'CPU를 거의 다 태웠다'");
+        System.out.println("CPU 관점에서는: 컨텍스트 스위치 캐시 미스 파이프라인 flush 까지 전부 cpuTime으로 계산");
+        System.out.println("‘일 잘함’과 ‘바쁨’은 다르다.");
+        System.out.println();
+        System.out.println("효율 = throughput / threads - 스레드당 기여도 (가성비)");
+        System.out.println();
+        System.out.println("Throughput = “단위 시간당 완료된 작업의 수”");
     }
 
     // ---------------------------
