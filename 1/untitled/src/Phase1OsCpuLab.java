@@ -69,40 +69,88 @@ public class Phase1OsCpuLab {
     }
 
     // ---------------------------
-    // Experiment 1: threads vs performance (CPU-bound)
-    // ---------------------------
+// Experiment 1: threads vs performance (CPU-bound)
+// ---------------------------
     static void experiment1_threadsVsThroughput(int[] threadCounts) throws Exception {
         System.out.println("------------------------------------------------------------");
         System.out.println("[Experiment 1] 스레드 수 vs 성능 (CPU-bound)");
-        System.out.println("Goal: 코어 수까지는 보통 성능↑, 그 이후는 context switch/cache 영향으로 정체/하락을 관찰");
-        System.out.println("Metric: wall(ms), throughput(M ops/s), processCpu(ms), cpuUtilApprox(%)");
+        System.out.println("Goal: 스레드 수 증가에 따른 처리량 증가/체감/하락 패턴 관찰");
+        System.out.println("Metric: wall(ms), throughput(M ops/s), processCpu(ms), cpuUtilApprox(%), efficiency(throughput/threads)");
         System.out.println();
 
-        System.out.printf("%8s | %10s | %14s | %14s | %14s%n",
-                "threads", "wall(ms)", "throughput", "cpuTime(ms)", "cpuUtil~(%)");
-        System.out.println("------------------------------------------------------------------------------------");
+        System.out.printf("%8s | %10s | %14s | %14s | %14s | %14s%n",
+                "threads", "wall(ms)", "throughput", "cpuTime(ms)", "cpuUtil~(%)", "eff(Mops/t)");
+        System.out.println("--------------------------------------------------------------------------------------------------------------");
+
+        // 결과 저장용
+        class Row {
+            final int threads;
+            final Result r;
+            final double eff; // throughput per thread (M ops/s per thread)
+            Row(int threads, Result r) {
+                this.threads = threads;
+                this.r = r;
+                this.eff = r.throughputMOpsPerSec / Math.max(1, threads);
+            }
+        }
+
+        java.util.List<Row> rows = new java.util.ArrayList<>();
 
         for (int t : threadCounts) {
             Result r = runCpuBound(t, CPU_WORK_ITERS_PER_THREAD, WorkMode.PLAIN, 0);
-            System.out.printf("%8d | %10d | %14.2f | %14.0f | %14.1f%n",
-                    t, r.wallMs, r.throughputMOpsPerSec, r.cpuMs, r.cpuUtilApprox);
+            Row row = new Row(t, r);
+            rows.add(row);
+
+            System.out.printf("%8d | %10d | %14.2f | %14.0f | %14.1f | %14.2f%n",
+                    t, r.wallMs, r.throughputMOpsPerSec, r.cpuMs, r.cpuUtilApprox, row.eff);
         }
 
-        System.out.println("\n배울 점:");
-        System.out.println("- CPU-bound 작업은 대개 스레드가 '코어 수' 근처에서 가장 효율적");
-        System.out.println("- 코어 수를 크게 넘기면: context switch 증가 + cache thrash + 스케줄러 오버헤드로 throughput이 정체/하락");
+        // ---------------------------
+        // 자동 요약(데이터 기반)
+        // ---------------------------
+        Row peakThroughput = rows.get(0);
+        Row bestEfficiency = rows.get(0);
+
+        for (Row row : rows) {
+            if (row.r.throughputMOpsPerSec > peakThroughput.r.throughputMOpsPerSec) {
+                peakThroughput = row;
+            }
+            if (row.eff > bestEfficiency.eff) {
+                bestEfficiency = row;
+            }
+        }
+
+        double target90 = peakThroughput.r.throughputMOpsPerSec * 0.90;
+        Row minThreadsFor90 = null;
+        for (Row row : rows) {
+            if (row.r.throughputMOpsPerSec >= target90) {
+                minThreadsFor90 = row;
+                break;
+            }
+        }
+
         System.out.println();
-        System.out.println(" threads |   wall(ms) |     throughput |    cpuTime(ms) |    cpuUtil~(%)");
-        System.out.println("      28 |         64 |       10830.98 |           1719 |           95.9");
-        System.out.println("CPU-bound 작업은 ‘코어 수 근처’에서 최대 처리량이 나올 가능성이 높다.");
-        System.out.println("하지만 효율과 안정성은 그보다 낮은 지점에서 최고다.");
-        System.out.println("cpuUtil 95.9%의 함정은 '효율적으로 태웠다' 가 아니라 'CPU를 거의 다 태웠다'");
-        System.out.println("CPU 관점에서는: 컨텍스트 스위치 캐시 미스 파이프라인 flush 까지 전부 cpuTime으로 계산");
-        System.out.println("‘일 잘함’과 ‘바쁨’은 다르다.");
+        System.out.println("요약(자동 계산):");
+        System.out.printf("- Peak throughput: threads=%d, throughput=%.2f M ops/s (wall=%dms, cpuUtil~%.1f%%)%n",
+                peakThroughput.threads, peakThroughput.r.throughputMOpsPerSec, peakThroughput.r.wallMs, peakThroughput.r.cpuUtilApprox);
+
+        System.out.printf("- Best efficiency(throughput/threads): threads=%d, eff=%.2f M ops/s/thread (throughput=%.2f)%n",
+                bestEfficiency.threads, bestEfficiency.eff, bestEfficiency.r.throughputMOpsPerSec);
+
+        if (minThreadsFor90 != null) {
+            System.out.printf("- 90%% of peak(>= %.2f): 최소 threads=%d (throughput=%.2f)%n",
+                    target90, minThreadsFor90.threads, minThreadsFor90.r.throughputMOpsPerSec);
+        } else {
+            System.out.printf("- 90%% of peak(>= %.2f): 만족하는 threads 없음 (측정 범위/환경을 확인)%n", target90);
+        }
+
         System.out.println();
-        System.out.println("효율 = throughput / threads - 스레드당 기여도 (가성비)");
+        System.out.println("해석 가이드:");
+        System.out.println("- Throughput = 단위 시간당 완료한 작업 수(성과)");
+        System.out.println("- cpuUtil~(%) = CPU가 바빴던 정도(성과와 동일하지 않음)");
+        System.out.println("- Efficiency(throughput/threads) = 스레드 1개당 기여도(가성비)");
+        System.out.println("- Peak throughput은 환경/타이밍에 따라 흔들릴 수 있으니 3~5회 반복 후 평균/분산을 같이 보길 권장");
         System.out.println();
-        System.out.println("Throughput = “단위 시간당 완료된 작업의 수”");
     }
 
     // ---------------------------
@@ -120,34 +168,67 @@ public class Phase1OsCpuLab {
         int t = pickClosest(threadCounts, core);
         long iters = CPU_WORK_ITERS_PER_THREAD;
 
-        System.out.println("Using threads=" + t + " (closest to cores=" + core + "), itersPerThread=" + iters);
-        System.out.printf("%18s | %10s | %14s | %14s | %14s%n",
-                "mode(yieldEvery)", "wall(ms)", "throughput", "cpuTime(ms)", "cpuUtil~(%)");
-        System.out.println("------------------------------------------------------------------------------------------------");
+        // 총 작업량(모든 모드에서 동일) -> 파생 지표 계산에 사용
+        long totalOps = iters * (long) t;
+        double totalMOps = totalOps / 1_000_000.0;
 
-        // yieldEvery = 0  => no yield
+        System.out.println("Using threads=" + t + " (closest to cores=" + core + "), itersPerThread=" + iters
+                + " (total=" + String.format("%.2f", totalMOps) + " M ops)");
+        System.out.println();
+
+        System.out.printf("%18s | %10s | %14s | %14s | %14s | %14s | %14s | %12s%n",
+                "mode(yieldEvery)", "wall(ms)", "throughput", "cpuTime(ms)", "cpuUtil~(%)",
+                "cpuMsPerMOps", "mopsPerCpuSec", "slowVsNONE");
+        System.out.println("-----------------------------------------------------------------------------------------------------------------------------------------------");
+
+        // Baseline: yield 없음
         Result r0 = runCpuBound(t, iters, WorkMode.PLAIN, 0);
-        System.out.printf("%18s | %10d | %14.2f | %14.0f | %14.1f%n",
-                "NONE", r0.wallMs, r0.throughputMOpsPerSec, r0.cpuMs, r0.cpuUtilApprox);
+        long baseWall = Math.max(1, r0.wallMs);
+
+        // 출력 helper
+        java.util.function.BiConsumer<String, Result> printRow = (name, r) -> {
+            // 비용 지표: 1M ops 처리당 CPU ms (낮을수록 좋음)
+            double cpuMsPerMOps = (r.cpuMs > 0) ? (r.cpuMs / totalMOps) : Double.NaN;
+
+            // 효율 지표: CPU 1초당 처리한 M ops (높을수록 좋음)
+            double mopsPerCpuSec = (r.cpuMs > 0) ? (totalMOps / (r.cpuMs / 1000.0)) : Double.NaN;
+
+            // 체감 비용: NONE 대비 wall 배수 (1.0이 baseline)
+            double slowVsNone = r.wallMs / (double) baseWall;
+
+            System.out.printf("%18s | %10d | %14.2f | %14.0f | %14.1f | %14.2f | %14.2f | %12.2f%n",
+                    name, r.wallMs, r.throughputMOpsPerSec, r.cpuMs, r.cpuUtilApprox,
+                    cpuMsPerMOps, mopsPerCpuSec, slowVsNone);
+        };
+
+        // Print baseline row
+        printRow.accept("NONE", r0);
 
         // yieldEvery small => frequent yield (bad)
         Result r1 = runCpuBound(t, iters, WorkMode.YIELD, 1_000);
-        System.out.printf("%18s | %10d | %14.2f | %14.0f | %14.1f%n",
-                "YIELD/1k", r1.wallMs, r1.throughputMOpsPerSec, r1.cpuMs, r1.cpuUtilApprox);
+        printRow.accept("YIELD/1k", r1);
 
         Result r2 = runCpuBound(t, iters, WorkMode.YIELD, 10_000);
-        System.out.printf("%18s | %10d | %14.2f | %14.0f | %14.1f%n",
-                "YIELD/10k", r2.wallMs, r2.throughputMOpsPerSec, r2.cpuMs, r2.cpuUtilApprox);
+        printRow.accept("YIELD/10k", r2);
 
         Result r3 = runCpuBound(t, iters, WorkMode.YIELD, 100_000);
-        System.out.printf("%18s | %10d | %14.2f | %14.0f | %14.1f%n",
-                "YIELD/100k", r3.wallMs, r3.throughputMOpsPerSec, r3.cpuMs, r3.cpuUtilApprox);
+        printRow.accept("YIELD/100k", r3);
 
-        System.out.println("\n배울 점:");
-        System.out.println("- 작업 단위를 너무 잘게 쪼개거나 자주 양보하면 스케줄링/컨텍스트 스위치가 늘어 오버헤드가 커짐");
-        System.out.println("- 실무에서도 '너무 작은 작업을 스레드풀에 던지기'는 성능을 망칠 수 있음");
+        System.out.println();
+        System.out.println("해석 가이드(비용/효율 관점 추가):");
+        System.out.println("- throughput(M ops/s): 초당 완료한 작업량(성과). 높을수록 좋음");
+        System.out.println("- cpuTime(ms): 같은 총 작업량을 처리하는데 CPU가 실제로 쓴 시간(비용). 전환/오버헤드가 늘면 커질 수 있음");
+        System.out.println("- cpuUtil~(%): CPU가 바빴던 정도(바쁨=성과 아님). 높아도 throughput이 낮을 수 있음");
+        System.out.println("- cpuMsPerMOps: 1M ops당 CPU ms(비용). 낮을수록 효율적");
+        System.out.println("- mopsPerCpuSec: CPU 1초당 처리한 M ops(효율). 높을수록 효율적");
+        System.out.println("- slowVsNONE: NONE 대비 체감 시간 배수(벽시계). 1.00보다 크면 느려짐");
+        System.out.println();
+        System.out.println("배울 점:");
+        System.out.println("- yield를 자주 할수록: slowVsNONE↑, cpuMsPerMOps↑, mopsPerCpuSec↓ 같은 패턴이 나오기 쉽다");
+        System.out.println("- 즉, CPU는 더 바쁜데(비용↑) 실제 완료한 일은 줄어드는(성과↓) '스케줄링/전환 오버헤드'를 눈으로 확인할 수 있다");
         System.out.println();
     }
+
 
     // ---------------------------
     // Experiment 3: busy-wait vs sleep vs blocking
