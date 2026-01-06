@@ -183,17 +183,26 @@ public class Phase1OsCpuLab {
 
         // Baseline: yield 없음
         Result r0 = runCpuBound(t, iters, WorkMode.PLAIN, 0);
+
+        // “yield를 전혀 하지 않았을 때, 같은 일을 끝내는 데 걸린 기준 시간”
         long baseWall = Math.max(1, r0.wallMs);
 
         // 출력 helper
         java.util.function.BiConsumer<String, Result> printRow = (name, r) -> {
             // 비용 지표: 1M ops 처리당 CPU ms (낮을수록 좋음)
+            // CPU 비용의 핵심 지표: 100만 번의 일을 처리하는 데 CPU가 몇 ms를 소비했는가
+            // 컨텍스트 스위치 / 캐시 미스 / 스케줄링 비용이 ‘CPU 비용’으로 드러나는 지표
             double cpuMsPerMOps = (r.cpuMs > 0) ? (r.cpuMs / totalMOps) : Double.NaN;
 
             // 효율 지표: CPU 1초당 처리한 M ops (높을수록 좋음)
+            // CPU 효율(연비): CPU 1초로 몇 M ops를 처리했는가
+            // cpuUtil과의 차이 (중요)
+            // cpuUtil: CPU가 얼마나 바빴나, mopsPerCpuSec: 그 바쁨으로 얼마나 성과를 냈나
+            //👉 바쁨 ≠ 효율
             double mopsPerCpuSec = (r.cpuMs > 0) ? (totalMOps / (r.cpuMs / 1000.0)) : Double.NaN;
 
             // 체감 비용: NONE 대비 wall 배수 (1.0이 baseline)
+            // “사람 기준 체감 비용”
             double slowVsNone = r.wallMs / (double) baseWall;
 
             System.out.printf("%18s | %10d | %14.2f | %14.0f | %14.1f | %14.2f | %14.2f | %12.2f%n",
@@ -270,71 +279,149 @@ public class Phase1OsCpuLab {
     enum WorkMode { PLAIN, YIELD }
 
     static class Result {
-        long wallMs;
-        double cpuMs;
-        double cpuUtilApprox;        // cpuMs / wallMs / cores * 100
-        double throughputMOpsPerSec; // million-ops per second (approx)
+        long wallMs;                  // 벽시계 시간(ms): 사람이 느끼는 실제 경과 시간 (start~done)
+        double cpuMs;                 // CPU 시간(ms): 각 스레드가 "CPU 위에서 실제 실행"한 시간의 합
+        double cpuUtilApprox;         // 근사 CPU 사용률(%): cpuMs / (wallMs * cores) * 100
+        double throughputMOpsPerSec;  // 처리량(M ops/s): 전체 ops / wall time (초) / 1e6
     }
 
     static Result runCpuBound(int threads, long itersPerThread, WorkMode mode, int yieldEvery) throws Exception {
-        // One "op" = one loop iteration in cpuWork()
-        final long totalOps = itersPerThread * threads;
+        // ---------------------------
+        // 실험 정의(Workload)
+        // ---------------------------
+        // One "op" = cpuWork() 루프 1회(=한 번의 계산 단위)
+        // Experiment 1에서는 "per-thread workload"를 고정(itersPerThread 고정)해서
+        // threads를 늘렸을 때 throughput이 어떻게 바뀌는지(확장성, 수확체감)를 보려는 목적.
+        final long totalOps = itersPerThread * threads; // 총 작업량(= 스레드당 작업량 * 스레드 수)
 
+        // ---------------------------
+        // CPU 시간 측정을 위한 준비
+        // ---------------------------
+        // ThreadMXBean의 getThreadCpuTime(threadId):
+        // "그 스레드가 CPU에서 실제로 실행된 시간"을 나노초로 반환.
+        // (ready 상태로 기다린 시간, 스케줄링 대기 시간은 포함되지 않음)
         ThreadMXBean bean = ManagementFactory.getThreadMXBean();
         boolean cpuTimeSupported = bean.isThreadCpuTimeSupported();
         if (cpuTimeSupported && !bean.isThreadCpuTimeEnabled()) bean.setThreadCpuTimeEnabled(true);
 
+        // ---------------------------
+        // 출발선 맞추기(중요)
+        // ---------------------------
+        // start latch:
+        // 모든 worker 스레드를 미리 만들어 "대기" 시켜 둔 다음,
+        // start.countDown()을 한 번 호출해서 최대한 동시에 출발하게 함.
+        // 이렇게 해야 "스레드 생성/시작 타이밍 차이"가 측정 결과를 오염시키지 않음.
         CountDownLatch start = new CountDownLatch(1);
+
+        // done latch:
+        // 모든 worker가 끝날 때까지 기다리기 위한 latch.
         CountDownLatch done = new CountDownLatch(threads);
 
+        // 각 스레드의 CPU 시간을 저장할 배열(나노초 단위)
         final long[] threadCpuNanos = new long[threads];
         final Thread[] workers = new Thread[threads];
 
         for (int i = 0; i < threads; i++) {
             final int idx = i;
+
             workers[i] = new Thread(() -> {
                 try {
+                    // 1) 출발선에서 대기
                     start.await();
+
+                    // 2) 이 스레드의 CPU 시간 측정 시작
                     long tid = Thread.currentThread().getId();
                     long cpuStart = cpuTimeSupported ? bean.getThreadCpuTime(tid) : 0L;
 
-                    long local = 0;
+                    // 3) 실제 CPU-bound 작업 수행
+                    long local;
                     if (mode == WorkMode.PLAIN) {
+                        // yield 없이 "계속" 계산(스케줄러가 강제로 선점할 때만 전환)
                         local = cpuWork(itersPerThread);
                     } else {
+                        // 일정 주기마다 Thread.yield() 호출
+                        // -> OS 스케줄러에게 "나 잠깐 양보할게" 신호
+                        // -> 너무 자주 yield하면 context switch / cache thrash 증가로 throughput 하락 가능
                         local = cpuWorkWithYield(itersPerThread, yieldEvery);
                     }
-                    BLACKHOLE ^= local; // prevent dead-code elimination
 
+                    // 4) JIT 최적화로 루프가 통째로 제거되는 것을 방지(매우 중요)
+                    //    컴파일러가 "결과가 사용되지 않는다"고 판단하면 계산을 삭제할 수 있음.
+                    //    그래서 결과를 전역 변수에 섞어 "사용된다"는 흔적을 남김.
+                    BLACKHOLE ^= local;
+
+                    // 5) CPU 시간 측정 종료
                     long cpuEnd = cpuTimeSupported ? bean.getThreadCpuTime(tid) : 0L;
                     threadCpuNanos[idx] = Math.max(0L, cpuEnd - cpuStart);
+
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 } finally {
+                    // 6) 완료 신호
                     done.countDown();
                 }
             }, "cpu-worker-" + i);
+
             workers[i].start();
         }
 
+        // ---------------------------
+        // wall time(벽시계 시간) 측정
+        // ---------------------------
+        // wall time은 "사람이 느끼는 실제 경과 시간"이다.
+        // 스레드가 CPU를 못 받아 기다린 시간/스케줄링 지연/전환 오버헤드 모두 포함됨.
         long wallStart = System.nanoTime();
+
+        // 모든 worker를 동시에 출발
         start.countDown();
+
+        // 모든 worker가 끝날 때까지 대기
         done.await();
         long wallEnd = System.nanoTime();
 
         long wallMs = TimeUnit.NANOSECONDS.toMillis(wallEnd - wallStart);
 
+        // ---------------------------
+        // cpuMs(총 CPU 시간) 계산
+        // ---------------------------
+        // cpuMs = (각 스레드의 "CPU 위에서 실제 실행된 시간")을 모두 합산한 값.
+        // 멀티코어에서 여러 스레드가 병렬로 돌면:
+        // cpuMs는 wallMs보다 훨씬 커질 수 있다.
         double cpuMs = 0;
         for (long ns : threadCpuNanos) cpuMs += ns / 1_000_000.0;
 
+        // ---------------------------
+        // cpuUtilApprox(근사 CPU 사용률) 계산
+        // ---------------------------
+        // "사용 가능 CPU 시간" = wallMs * cores
+        // 예: cores=28, wallMs=100ms -> 사용 가능 CPU시간=2800ms
+        // cpuMs가 1400ms면 cpuUtil ~ 50%
+        //
+        // 단, 이건 근사치:
+        // - 논리코어(하이퍼스레딩) 포함
+        // - Windows 스케줄러 / P/E 코어 / 터보부스트 / 전력 제한 등으로
+        //   실제 체감과 1:1로 맞진 않지만, "비교용 지표"로는 매우 유용.
         int cores = Runtime.getRuntime().availableProcessors();
         double cpuUtilApprox = (wallMs > 0)
                 ? (cpuMs / (wallMs * 1.0) / cores) * 100.0
                 : 0.0;
 
+        // ---------------------------
+        // throughput(M ops/s) 계산
+        // ---------------------------
+        // throughput은 "단위 시간당 완료된 작업 수".
+        // 여기서는 totalOps(총 루프 횟수)를 wallSec(벽시계 초)로 나눔.
+        // 즉, "초당 몇 번의 루프(ops)를 끝냈나"를 의미.
+        //
+        // 주의: totalOps가 threads에 비례하므로,
+        // Experiment 1은 "총 작업량 고정"이 아니라 "스레드당 작업량 고정" 실험이다.
+        // -> threads를 늘리면 총 작업량도 늘어난다.
         double wallSec = Math.max(1e-9, (wallEnd - wallStart) / 1_000_000_000.0);
         double throughputMOps = (totalOps / wallSec) / 1_000_000.0;
 
+        // ---------------------------
+        // 결과 묶어서 반환
+        // ---------------------------
         Result r = new Result();
         r.wallMs = wallMs;
         r.cpuMs = cpuMs;
@@ -342,6 +429,7 @@ public class Phase1OsCpuLab {
         r.throughputMOpsPerSec = throughputMOps;
         return r;
     }
+
 
     // CPU-bound work: simple integer mixing (cheap but not trivial)
     static long cpuWork(long iters) {
